@@ -3,6 +3,9 @@ import subprocess
 import socket
 import time
 import sys
+import platform
+import ctypes
+from ctypes import c_uint32, c_void_p, byref, create_string_buffer
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QComboBox,
                              QVBoxLayout, QWidget, QFileDialog, QMessageBox, QSlider, QHBoxLayout,
                              QAction, QToolBar, QDialog, QLineEdit, QGridLayout, QFrame, QSpinBox,
@@ -10,8 +13,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QCo
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import QIcon, QFont
 from pymediainfo import MediaInfo
-import ctypes
-from ctypes import POINTER, WINFUNCTYPE, c_bool, c_byte, c_char_p
+
+# Platform-specific imports
+if platform.system() == "Windows":
+    from ctypes import POINTER, WINFUNCTYPE, c_bool, c_byte, c_char_p
 
 class MultitracksVLC(QMainWindow):
     def __init__(self):
@@ -22,9 +27,16 @@ class MultitracksVLC(QMainWindow):
         self.video_file = None
         self.audio_tracks = []
         self.video_duration = 0
-        self.vlc_path = r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
+        # Set default VLC path based on platform
+        if platform.system() == "Darwin":  # macOS
+            self.vlc_path = "/Applications/VLC.app/Contents/MacOS/VLC"
+        elif platform.system() == "Windows":
+            self.vlc_path = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+        else:  # Linux
+            self.vlc_path = "/usr/bin/vlc"
         self.num_tracks = 2
         self.video_started = False
+        self.vlc_processes = []  # Store VLC process handles for cleanup
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_playback_time)
         self.initUI()
@@ -258,8 +270,26 @@ class MultitracksVLC(QMainWindow):
         """
         if self.video_started:
             self.timer.stop()
+            # First try to quit gracefully via RC interface
             for port in range(4212, 4212 + self.num_tracks):
                 self.send_command("localhost", port, "quit", is_quit=True)
+            
+            # Give VLC a moment to quit gracefully
+            time.sleep(0.5)
+            
+            # Force terminate any remaining VLC processes
+            for proc in self.vlc_processes:
+                try:
+                    if proc.poll() is None:  # Process still running
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()  # Force kill if terminate didn't work
+                    except Exception:
+                        pass
+            
+            self.vlc_processes.clear()
         QApplication.quit()
 
     def closeEvent(self, event):
@@ -361,34 +391,149 @@ class MultitracksVLC(QMainWindow):
 
     def get_audio_devices(self):
         """
-        Retrieve audio devices from the system with their DirectSound GUIDs.
+        Retrieve audio devices from the system.
 
         Returns:
-            list: List of tuples containing GUID and device description.
+            list: List of tuples containing device ID and device description.
+                  On Windows: (DirectSound GUID, description)
+                  On macOS: (CoreAudio device ID, device name)
         """
         devices = []
-        dsound = ctypes.windll.dsound
-        GUID = c_byte * 16
-        LPDSENUMCALLBACK = WINFUNCTYPE(c_bool, POINTER(GUID), c_char_p, c_char_p)
+        
+        if platform.system() == "Windows":
+            # Windows: Use DirectSound enumeration
+            dsound = ctypes.windll.dsound
+            GUID = c_byte * 16
+            LPDSENUMCALLBACK = WINFUNCTYPE(c_bool, POINTER(GUID), c_char_p, c_char_p)
 
-        def audio_enum_callback(lp_guid, description, module):
+            def audio_enum_callback(lp_guid, description, module):
+                try:
+                    if lp_guid:
+                        guid = bytes(ctypes.cast(lp_guid, POINTER(GUID)).contents)
+                        guid_str = f'{{{guid[3]:02X}{guid[2]:02X}{guid[1]:02X}{guid[0]:02X}-' \
+                                   f'{guid[5]:02X}{guid[4]:02X}-' \
+                                   f'{guid[7]:02X}{guid[6]:02X}-' \
+                                   f'{guid[8]:02X}{guid[9]:02X}-' \
+                                   f'{guid[10]:02X}{guid[11]:02X}{guid[12]:02X}{guid[13]:02X}{guid[14]:02X}{guid[15]:02X}}}'
+                        devices.append((guid_str, description.decode('mbcs')))
+                    else:
+                        devices.append((None, description.decode('mbcs')))
+                except UnicodeDecodeError:
+                    devices.append((None, "Unknown Device (Decode Error)"))
+                return True
+
+            dsound.DirectSoundEnumerateA(LPDSENUMCALLBACK(audio_enum_callback), None)
+            return [device for device in devices if device[0]]
+        
+        elif platform.system() == "Darwin":
+            # macOS: Use CoreAudio via ctypes
+            return self._get_macos_audio_devices()
+        
+        else:
+            # Linux: Use PulseAudio device names
             try:
-                if lp_guid:
-                    guid = bytes(ctypes.cast(lp_guid, POINTER(GUID)).contents)
-                    guid_str = f'{{{guid[3]:02X}{guid[2]:02X}{guid[1]:02X}{guid[0]:02X}-' \
-                               f'{guid[5]:02X}{guid[4]:02X}-' \
-                               f'{guid[7]:02X}{guid[6]:02X}-' \
-                               f'{guid[8]:02X}{guid[9]:02X}-' \
-                               f'{guid[10]:02X}{guid[11]:02X}{guid[12]:02X}{guid[13]:02X}{guid[14]:02X}{guid[15]:02X}}}'
-                    devices.append((guid_str, description.decode('mbcs')))
-                else:
-                    devices.append((None, description.decode('mbcs')))
-            except UnicodeDecodeError:
-                devices.append((None, "Unknown Device (Decode Error)"))
-            return True
-
-        dsound.DirectSoundEnumerateA(LPDSENUMCALLBACK(audio_enum_callback), None)
-        return [device for device in devices if device[0]]
+                result = subprocess.run(['pactl', 'list', 'short', 'sinks'], 
+                                       capture_output=True, text=True)
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            devices.append((parts[1], parts[1]))
+            except Exception:
+                devices.append(('default', 'Default Output'))
+            return devices
+    
+    def _get_macos_audio_devices(self):
+        """
+        Get audio output devices on macOS using CoreAudio framework.
+        
+        Returns:
+            list: List of tuples (device_id, device_name) for output devices.
+        """
+        devices = []
+        
+        try:
+            # Load CoreAudio and CoreFoundation frameworks
+            CoreAudio = ctypes.cdll.LoadLibrary(
+                '/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
+            CoreFoundation = ctypes.cdll.LoadLibrary(
+                '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+            
+            # CoreAudio constants
+            kAudioObjectSystemObject = 1
+            kAudioHardwarePropertyDevices = 1684370979  # 'dev#'
+            kAudioDevicePropertyDeviceNameCFString = 1819173229  # 'lnam'
+            kAudioDevicePropertyStreams = 1937009955  # 'stm#'
+            kAudioObjectPropertyScopeGlobal = 1735159650  # 'glob'
+            kAudioObjectPropertyScopeOutput = 1869968496  # 'outp'
+            kAudioObjectPropertyElementMain = 0
+            
+            # Define AudioObjectPropertyAddress structure
+            class AudioObjectPropertyAddress(ctypes.Structure):
+                _fields_ = [
+                    ("mSelector", c_uint32),
+                    ("mScope", c_uint32),
+                    ("mElement", c_uint32)
+                ]
+            
+            # Get device count
+            address = AudioObjectPropertyAddress(
+                kAudioHardwarePropertyDevices,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            )
+            size = c_uint32()
+            CoreAudio.AudioObjectGetPropertyDataSize(
+                kAudioObjectSystemObject, byref(address), 0, None, byref(size))
+            num_devices = size.value // 4
+            
+            # Get device IDs
+            device_ids = (c_uint32 * num_devices)()
+            CoreAudio.AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, byref(address), 0, None, byref(size), device_ids)
+            
+            # Setup CFStringGetCString
+            CoreFoundation.CFStringGetCString.argtypes = [
+                c_void_p, ctypes.c_char_p, ctypes.c_long, c_uint32]
+            CoreFoundation.CFStringGetCString.restype = ctypes.c_bool
+            
+            for dev_id in device_ids:
+                # Get device name
+                name_addr = AudioObjectPropertyAddress(
+                    kAudioDevicePropertyDeviceNameCFString,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                )
+                cf_string = c_void_p()
+                prop_size = c_uint32(ctypes.sizeof(c_void_p))
+                
+                if CoreAudio.AudioObjectGetPropertyData(
+                        dev_id, byref(name_addr), 0, None, 
+                        byref(prop_size), byref(cf_string)) == 0:
+                    # Convert CFString to Python string
+                    buf = create_string_buffer(256)
+                    if CoreFoundation.CFStringGetCString(
+                            cf_string, buf, 256, 0x08000100):  # kCFStringEncodingUTF8
+                        name = buf.value.decode('utf-8')
+                        
+                        # Check if device has output streams
+                        out_addr = AudioObjectPropertyAddress(
+                            kAudioDevicePropertyStreams,
+                            kAudioObjectPropertyScopeOutput,
+                            kAudioObjectPropertyElementMain
+                        )
+                        out_size = c_uint32()
+                        if CoreAudio.AudioObjectGetPropertyDataSize(
+                                dev_id, byref(out_addr), 0, None, 
+                                byref(out_size)) == 0 and out_size.value > 0:
+                            devices.append((str(dev_id), name))
+        
+        except Exception as e:
+            print(f"Error enumerating audio devices: {e}")
+            # Fallback: return a default device
+            devices.append(('0', 'Default Output'))
+        
+        return devices
 
     def start_vlc_instances(self, video_file, audio_tracks, device_guids):
         """
@@ -400,20 +545,49 @@ class MultitracksVLC(QMainWindow):
             device_guids (list): List of GUIDs of the audio devices.
         """
         video_file = os.path.abspath(video_file)
-        for i, (audio_track, device_guid) in enumerate(zip(audio_tracks, device_guids)):
+        for i, (audio_track, device_id) in enumerate(zip(audio_tracks, device_guids)):
+            # Build base VLC command
             vlc_cmd = [
                 self.vlc_path,
                 video_file,
                 f"--audio-track={audio_track}",
-                f"--aout=directx",
-                f"--directx-audio-device={device_guid}",
+            ]
+            
+            # Add platform-specific audio output arguments
+            if platform.system() == "Windows":
+                vlc_cmd.extend([
+                    "--aout=directx",
+                    f"--directx-audio-device={device_id}",
+                ])
+            elif platform.system() == "Darwin":  # macOS
+                vlc_cmd.extend([
+                    "--aout=auhal",
+                    f"--auhal-audio-device={device_id}",
+                ])
+            else:  # Linux
+                vlc_cmd.extend([
+                    "--aout=pulse",
+                    f"--pulse-audio-device={device_id}",
+                ])
+            
+            # Add common arguments
+            vlc_cmd.extend([
                 "--no-video-title-show",
                 f"--rc-host=localhost:{4212 + i}",
                 "--extraintf=rc",
-                "--intf=dummy",
-                "--fullscreen" if i == 0 else "--novideo"
-            ]
-            subprocess.Popen(vlc_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ])
+            
+            # First instance shows video, others are audio-only
+            if i == 0:
+                # vlc_cmd.append("--fullscreen")
+                # On macOS, use macosx interface for video; on Windows, dummy works
+                if platform.system() != "Darwin":
+                    vlc_cmd.append("--intf=dummy")
+            else:
+                vlc_cmd.extend(["--intf=dummy", "--novideo"])
+            
+            proc = subprocess.Popen(vlc_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.vlc_processes.append(proc)
         time.sleep(2)
 
     def send_command(self, host, port, command, is_quit=False):
@@ -649,10 +823,25 @@ class SettingsDialog(QDialog):
         Open a file dialog to browse for the VLC executable.
         """
         options = QFileDialog.Options()
-        vlc_path, _ = QFileDialog.getOpenFileName(self, "Select VLC Executable", "",
-                                                  "Executable Files (*.exe);;All Files (*)",
+        
+        # Set platform-specific file filter and starting directory
+        if platform.system() == "Darwin":  # macOS
+            file_filter = "Applications (*.app);;All Files (*)"
+            start_dir = "/Applications"
+        elif platform.system() == "Windows":
+            file_filter = "Executable Files (*.exe);;All Files (*)"
+            start_dir = "C:\\Program Files\\VideoLAN\\VLC"
+        else:  # Linux
+            file_filter = "All Files (*)"
+            start_dir = "/usr/bin"
+        
+        vlc_path, _ = QFileDialog.getOpenFileName(self, "Select VLC Executable", start_dir,
+                                                  file_filter,
                                                   options=options)
         if vlc_path:
+            # On macOS, if user selects .app bundle, append the actual executable path
+            if platform.system() == "Darwin" and vlc_path.endswith(".app"):
+                vlc_path = os.path.join(vlc_path, "Contents", "MacOS", "VLC")
             self.vlc_path_input.setText(vlc_path)
 
     def get_vlc_path(self):
