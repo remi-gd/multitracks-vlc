@@ -2,7 +2,7 @@
 
 Multitracks VLC is a Python application that allows you to play a video file with two (or more) different audio tracks on two (or more) different audio devices simultaneously. This is useful for scenarios where you need to output different audio tracks to different devices, such as headphones and speakers.
 
-This is a fork with added support for macOS.
+Supports Windows, macOS, and Linux.
 
 ## Direct Execution
 
@@ -113,3 +113,4 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/intro)
 - [pymediainfo](https://pymediainfo.readthedocs.io/)
 - [VLC Media Player](https://www.videolan.org/)
+- [grintroy](https://github.com/grintroy) for adding macOS and Linux support
